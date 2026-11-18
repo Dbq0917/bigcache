@@ -582,6 +582,89 @@ func TestCacheInitialCapacity(t *testing.T) {
 	assertEqual(t, 1024*1024, cache.Capacity())
 }
 
+func TestCacheCompactsObsoleteEntriesBeforeGrowing(t *testing.T) {
+	t.Parallel()
+
+	cache, err := New(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         time.Hour,
+		MaxEntriesInWindow: 10,
+		MaxEntrySize:       64,
+	})
+	noError(t, err)
+
+	initialCapacity := cache.Capacity()
+	value := blob('x', 32)
+
+	for i := 0; i < 5000; i++ {
+		noError(t, cache.Set("key", value))
+	}
+
+	assertEqual(t, initialCapacity, cache.Capacity())
+	cachedValue, err := cache.Get("key")
+	noError(t, err)
+	assertEqual(t, value, cachedValue)
+}
+
+func TestCacheDeleteChurnReusesCompactedSpace(t *testing.T) {
+	t.Parallel()
+
+	cache, err := New(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         time.Hour,
+		MaxEntriesInWindow: 10,
+		MaxEntrySize:       64,
+	})
+	noError(t, err)
+
+	initialCapacity := cache.Capacity()
+	value := blob('x', 32)
+
+	for i := 0; i < 5000; i++ {
+		key := fmt.Sprintf("key%d", i)
+		noError(t, cache.Set(key, value))
+		noError(t, cache.Delete(key))
+	}
+
+	assertEqual(t, initialCapacity, cache.Capacity())
+	assertEqual(t, 0, cache.Len())
+}
+
+func TestConcurrentUpdatesCompactWithoutCorruption(t *testing.T) {
+	t.Parallel()
+
+	cache, err := New(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         time.Hour,
+		MaxEntriesInWindow: 10,
+		MaxEntrySize:       64,
+	})
+	noError(t, err)
+
+	value := blob('x', 32)
+	var wg sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 2000; i++ {
+				key := fmt.Sprintf("key%d", (worker+i)%4)
+				if err := cache.Set(key, value); err != nil {
+					t.Errorf("set failed: %v", err)
+					return
+				}
+				if _, err := cache.Get(key); err != nil && err != ErrEntryNotFound {
+					t.Errorf("get failed: %v", err)
+					return
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+
+	assertEqual(t, 4, cache.Len())
+}
+
 func TestRemoveEntriesWhenShardIsFull(t *testing.T) {
 	t.Parallel()
 

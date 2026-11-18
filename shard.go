@@ -138,7 +138,7 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer)
 
 	for {
-		if index, err := s.entries.Push(w); err == nil {
+		if index, err := s.pushEntry(w); err == nil {
 			s.hashmap[hashedKey] = uint64(index)
 			s.lock.Unlock()
 			return nil
@@ -162,7 +162,7 @@ func (s *cacheShard) addNewWithoutLock(key string, hashedKey uint64, entry []byt
 	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer)
 
 	for {
-		if index, err := s.entries.Push(w); err == nil {
+		if index, err := s.pushEntry(w); err == nil {
 			s.hashmap[hashedKey] = uint64(index)
 			return nil
 		}
@@ -176,6 +176,7 @@ func (s *cacheShard) setWrappedEntryWithoutLock(currentTimestamp uint64, w []byt
 	if previousIndex := s.hashmap[hashedKey]; previousIndex != 0 {
 		if previousEntry, err := s.entries.Get(int(previousIndex)); err == nil {
 			resetHashFromEntry(previousEntry)
+			delete(s.hashmap, hashedKey)
 		}
 	}
 
@@ -186,7 +187,7 @@ func (s *cacheShard) setWrappedEntryWithoutLock(currentTimestamp uint64, w []byt
 	}
 
 	for {
-		if index, err := s.entries.Push(w); err == nil {
+		if index, err := s.pushEntry(w); err == nil {
 			s.hashmap[hashedKey] = uint64(index)
 			return nil
 		}
@@ -194,6 +195,39 @@ func (s *cacheShard) setWrappedEntryWithoutLock(currentTimestamp uint64, w []byt
 			return errors.New("entry is bigger than max shard size")
 		}
 	}
+}
+
+func (s *cacheShard) pushEntry(wrappedEntry []byte) (int, error) {
+	if !s.entries.CanPush(wrappedEntry) {
+		hasObsoleteEntries := s.entries.Len() > len(s.hashmap)
+		canAvoidGrowth := !s.entries.AtMaxCapacity() && s.entries.CanCompactToFit(wrappedEntry)
+		if hasObsoleteEntries || canAvoidGrowth {
+			if err := s.compact(); err != nil && s.isVerbose {
+				s.logger.Printf("Failed to compact shard: %v", err)
+			}
+		}
+	}
+	return s.entries.Push(wrappedEntry)
+}
+
+func (s *cacheShard) compact() error {
+	indexes, err := s.entries.Compact(func(index int, wrappedEntry []byte) bool {
+		hashedKey := readHashFromEntry(wrappedEntry)
+		return s.hashmap[hashedKey] == uint64(index)
+	})
+	if err != nil {
+		return err
+	}
+
+	for hashedKey, index := range s.hashmap {
+		if newIndex, ok := indexes[int(index)]; ok {
+			s.hashmap[hashedKey] = uint64(newIndex)
+		} else {
+			delete(s.hashmap, hashedKey)
+		}
+	}
+
+	return nil
 }
 
 func (s *cacheShard) append(key string, hashedKey uint64, entry []byte) error {

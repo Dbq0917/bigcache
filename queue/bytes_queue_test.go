@@ -149,6 +149,53 @@ func TestReuseAvailableSpace(t *testing.T) {
 	assertEqual(t, blob('b', 20), pop(queue))
 }
 
+func TestCompactDropsEntriesAndRemapsIndexes(t *testing.T) {
+	t.Parallel()
+
+	queue := NewBytesQueue(100, 0, false)
+	firstIndex, _ := queue.Push([]byte("first"))
+	_, _ = queue.Push([]byte("drop"))
+	thirdIndex, _ := queue.Push([]byte("third"))
+
+	indexes, err := queue.Compact(func(_ int, data []byte) bool {
+		return !bytes.Equal(data, []byte("drop"))
+	})
+	noError(t, err)
+
+	assertEqual(t, 2, len(indexes))
+	firstNewIndex, ok := indexes[firstIndex]
+	assertEqual(t, true, ok)
+	thirdNewIndex, ok := indexes[thirdIndex]
+	assertEqual(t, true, ok)
+	assertEqual(t, []byte("first"), get(queue, firstNewIndex))
+	assertEqual(t, []byte("third"), get(queue, thirdNewIndex))
+	assertEqual(t, []byte("first"), pop(queue))
+	assertEqual(t, []byte("third"), pop(queue))
+	assertEqual(t, 100, queue.Capacity())
+}
+
+func TestCompactAfterQueueWraps(t *testing.T) {
+	t.Parallel()
+
+	queue := NewBytesQueue(100, 0, false)
+	_, _ = queue.Push(blob('a', 40))
+	secondIndex, _ := queue.Push(blob('b', 30))
+	thirdIndex, _ := queue.Push(blob('c', 20))
+	_, _ = queue.Pop()
+	fourthIndex, _ := queue.Push(blob('d', 10))
+
+	indexes, err := queue.Compact(nil)
+	noError(t, err)
+
+	assertEqual(t, 3, len(indexes))
+	assertEqual(t, blob('b', 30), get(queue, indexes[secondIndex]))
+	assertEqual(t, blob('c', 20), get(queue, indexes[thirdIndex]))
+	assertEqual(t, blob('d', 10), get(queue, indexes[fourthIndex]))
+	assertEqual(t, blob('b', 30), pop(queue))
+	assertEqual(t, blob('c', 20), pop(queue))
+	assertEqual(t, blob('d', 10), pop(queue))
+}
+
 func TestAllocateAdditionalSpace(t *testing.T) {
 	t.Parallel()
 
