@@ -35,6 +35,10 @@ type BytesQueue struct {
 	verbose      bool
 }
 
+// CompactFilter decides whether an entry should be kept while compacting a queue.
+// The entry is passed together with its current index in the queue.
+type CompactFilter func(index int, data []byte) bool
+
 type queueError struct {
 	message string
 }
@@ -104,6 +108,82 @@ func (q *BytesQueue) Push(data []byte) (int, error) {
 	q.push(data, neededSize)
 
 	return index, nil
+}
+
+// CanPush reports whether an entry can be pushed without growing or evicting.
+func (q *BytesQueue) CanPush(data []byte) bool {
+	neededSize := getNeededSize(len(data))
+	return q.canInsertAfterTail(neededSize) || q.canInsertBeforeHead(neededSize)
+}
+
+// CanCompactToFit reports whether the queue has enough free bytes to hold data
+// after all entries are packed into a contiguous block.
+func (q *BytesQueue) CanCompactToFit(data []byte) bool {
+	return q.freeSpace() >= getNeededSize(len(data))
+}
+
+// AtMaxCapacity reports whether the queue has reached its configured limit.
+func (q *BytesQueue) AtMaxCapacity() bool {
+	return q.maxCapacity > 0 && q.capacity >= q.maxCapacity
+}
+
+// Compact rebuilds the queue in FIFO order and keeps only entries accepted by
+// the filter. It returns a mapping from old indexes to new indexes.
+//
+// The rebuilt queue is prepared separately and replaces the current array only
+// after the whole source queue has been read successfully.
+func (q *BytesQueue) Compact(filter CompactFilter) (map[int]int, error) {
+	compacted := NewBytesQueue(q.capacity, q.maxCapacity, q.verbose)
+	indexes := make(map[int]int, q.count)
+
+	index := q.head
+	for i := 0; i < q.count; i++ {
+		data, blockSize, err := q.peek(index)
+		if err != nil {
+			return nil, err
+		}
+
+		if filter == nil || filter(index, data) {
+			newIndex, err := compacted.Push(data)
+			if err != nil {
+				return nil, err
+			}
+			indexes[index] = newIndex
+		}
+
+		index += blockSize
+		if index == q.rightMargin {
+			index = leftMarginIndex
+		}
+	}
+
+	q.full = compacted.full
+	q.array = compacted.array
+	q.capacity = compacted.capacity
+	q.head = compacted.head
+	q.tail = compacted.tail
+	q.count = compacted.count
+	q.rightMargin = compacted.rightMargin
+
+	return indexes, nil
+}
+
+func (q *BytesQueue) freeSpace() int {
+	if q.count == 0 {
+		return max(q.capacity-leftMarginIndex, 0)
+	}
+	if q.full {
+		return 0
+	}
+
+	var used int
+	if q.tail > q.head {
+		used = q.tail - q.head
+	} else {
+		used = q.rightMargin - q.head + q.tail - leftMarginIndex
+	}
+
+	return max(q.capacity-used-leftMarginIndex, 0)
 }
 
 func (q *BytesQueue) allocateAdditionalMemory(minimum int) {
