@@ -43,6 +43,58 @@ func TestLen(t *testing.T) {
 	assertEqual(t, queue.Len(), 1)
 }
 
+func TestPushParts(t *testing.T) {
+	t.Parallel()
+
+	// given
+	queue := NewBytesQueue(100, 0, false)
+
+	// when
+	index, err := queue.PushParts([]byte("he"), []byte("ll"), []byte("o"))
+
+	// then
+	assertEqual(t, nil, err)
+	entry, err := queue.Get(index)
+	assertEqual(t, nil, err)
+	assertEqual(t, []byte("hello"), entry)
+	assertEqual(t, 1, queue.Len())
+	assertEqual(t, []byte("hello"), pop(queue))
+}
+
+func TestPushPartsProducesSameBytesAsPush(t *testing.T) {
+	t.Parallel()
+
+	// given
+	parts := [][]byte{blob('a', 3), blob('b', 100), blob('c', 2000)}
+	whole := append(append(blob('a', 3), blob('b', 100)...), blob('c', 2000)...)
+	fromParts := NewBytesQueue(10, 0, false)
+	fromWhole := NewBytesQueue(10, 0, false)
+
+	// when
+	partsIndex, partsErr := fromParts.PushParts(parts...)
+	wholeIndex, wholeErr := fromWhole.Push(whole)
+
+	// then
+	assertEqual(t, nil, partsErr)
+	assertEqual(t, nil, wholeErr)
+	assertEqual(t, wholeIndex, partsIndex)
+	assertEqual(t, pop(fromWhole), pop(fromParts))
+}
+
+func TestPushPartsWhenFull(t *testing.T) {
+	t.Parallel()
+
+	// given
+	queue := NewBytesQueue(100, 100, false)
+
+	// when
+	queue.PushParts(blob('a', 40), blob('b', 40))
+	_, err := queue.PushParts(blob('c', 40), blob('d', 40))
+
+	// then
+	assertEqual(t, "Full queue. Maximum size limit reached.", err.Error())
+}
+
 func TestPeek(t *testing.T) {
 	t.Parallel()
 

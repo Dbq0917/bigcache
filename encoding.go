@@ -29,6 +29,19 @@ func wrapEntry(timestamp uint64, hash uint64, key string, entry []byte, buffer *
 	return blob[:blobLength]
 }
 
+// wrapEntryHeader writes the entry header (timestamp, hash and key length) into header
+// and returns the used portion of it. The returned header followed by the key and the
+// entry bytes forms exactly the same blob as wrapEntry produces, but pushing the three
+// parts into the queue separately avoids allocating a buffer big enough to hold the
+// whole entry. Header must be at least headersSizeInBytes long.
+func wrapEntryHeader(timestamp uint64, hash uint64, key string, header []byte) []byte {
+	binary.LittleEndian.PutUint64(header, timestamp)
+	binary.LittleEndian.PutUint64(header[timestampSizeInBytes:], hash)
+	binary.LittleEndian.PutUint16(header[timestampSizeInBytes+hashSizeInBytes:], uint16(len(key)))
+
+	return header[:headersSizeInBytes]
+}
+
 func appendToWrappedEntry(timestamp uint64, wrappedEntry []byte, entry []byte, buffer *[]byte) []byte {
 	blobLength := len(wrappedEntry) + len(entry)
 	if blobLength > len(*buffer) {

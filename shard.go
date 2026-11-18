@@ -135,10 +135,11 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 		}
 	}
 
-	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer)
+	header := wrapEntryHeader(currentTimestamp, hashedKey, key, s.entryBuffer)
+	keyBytes := []byte(key)
 
 	for {
-		if index, err := s.entries.Push(w); err == nil {
+		if index, err := s.entries.PushParts(header, keyBytes, entry); err == nil {
 			s.hashmap[hashedKey] = uint64(index)
 			s.lock.Unlock()
 			return nil
@@ -159,10 +160,11 @@ func (s *cacheShard) addNewWithoutLock(key string, hashedKey uint64, entry []byt
 		}
 	}
 
-	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer)
+	header := wrapEntryHeader(currentTimestamp, hashedKey, key, s.entryBuffer)
+	keyBytes := []byte(key)
 
 	for {
-		if index, err := s.entries.Push(w); err == nil {
+		if index, err := s.entries.PushParts(header, keyBytes, entry); err == nil {
 			s.hashmap[hashedKey] = uint64(index)
 			return nil
 		}

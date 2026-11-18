@@ -89,14 +89,8 @@ func (q *BytesQueue) Reset() {
 func (q *BytesQueue) Push(data []byte) (int, error) {
 	neededSize := getNeededSize(len(data))
 
-	if !q.canInsertAfterTail(neededSize) {
-		if q.canInsertBeforeHead(neededSize) {
-			q.tail = leftMarginIndex
-		} else if q.capacity+neededSize >= q.maxCapacity && q.maxCapacity > 0 {
-			return -1, errFullQueue
-		} else {
-			q.allocateAdditionalMemory(neededSize)
-		}
+	if err := q.ensureCapacity(neededSize); err != nil {
+		return -1, err
 	}
 
 	index := q.tail
@@ -104,6 +98,42 @@ func (q *BytesQueue) Push(data []byte) (int, error) {
 	q.push(data, neededSize)
 
 	return index, nil
+}
+
+// PushParts works like Push, but the entry is assembled from multiple parts
+// which are copied into the queue consecutively. The resulting bytes stored
+// in the queue are identical to pushing the concatenation of all parts,
+// but no contiguous buffer big enough to hold the whole entry is allocated.
+// Returns index for pushed data or error if maximum size queue limit is reached.
+func (q *BytesQueue) PushParts(parts ...[]byte) (int, error) {
+	dataLen := 0
+	for _, part := range parts {
+		dataLen += len(part)
+	}
+	neededSize := getNeededSize(dataLen)
+
+	if err := q.ensureCapacity(neededSize); err != nil {
+		return -1, err
+	}
+
+	index := q.tail
+
+	q.pushParts(neededSize, parts...)
+
+	return index, nil
+}
+
+func (q *BytesQueue) ensureCapacity(neededSize int) error {
+	if !q.canInsertAfterTail(neededSize) {
+		if q.canInsertBeforeHead(neededSize) {
+			q.tail = leftMarginIndex
+		} else if q.capacity+neededSize >= q.maxCapacity && q.maxCapacity > 0 {
+			return errFullQueue
+		} else {
+			q.allocateAdditionalMemory(neededSize)
+		}
+	}
+	return nil
 }
 
 func (q *BytesQueue) allocateAdditionalMemory(minimum int) {
@@ -146,6 +176,21 @@ func (q *BytesQueue) push(data []byte, len int) {
 
 	q.copy(data, len-headerEntrySize)
 
+	q.moveTailForward()
+}
+
+func (q *BytesQueue) pushParts(neededSize int, parts ...[]byte) {
+	headerEntrySize := binary.PutUvarint(q.headerBuffer, uint64(neededSize))
+	q.copy(q.headerBuffer, headerEntrySize)
+
+	for _, part := range parts {
+		q.copy(part, len(part))
+	}
+
+	q.moveTailForward()
+}
+
+func (q *BytesQueue) moveTailForward() {
 	if q.tail > q.head {
 		q.rightMargin = q.tail
 	}
