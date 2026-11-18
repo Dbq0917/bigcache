@@ -11,6 +11,15 @@ type Config struct {
 	// Interval between removing expired entries (clean up).
 	// If set to <= 0 then no action is performed. Setting to < 1 second is counterproductive — bigcache has a one second resolution.
 	CleanWindow time.Duration
+	// Maximum number of expired entries removed while holding a shard's lock.
+	// Cleanup continues in additional batches until the shard has no expired entries left.
+	// Lower values reduce the worst-case delay for reads and writes in the same shard.
+	// Default value is 0 which uses the built-in default of 1024.
+	CleanupBatchSize int
+	// Pause between cleanup batches when more expired entries remain.
+	// This bounds the CPU time used by cleanup and gives reads and writes a chance to run.
+	// Default value is 0 which uses the built-in default of 1ms.
+	CleanupBatchPause time.Duration
 	// Max number of entries in life window. Used only to calculate initial size for cache shards.
 	// When proper value is set then additional memory allocation does not occur.
 	MaxEntriesInWindow int
@@ -59,6 +68,8 @@ func DefaultConfig(eviction time.Duration) Config {
 		Shards:             1024,
 		LifeWindow:         eviction,
 		CleanWindow:        1 * time.Second,
+		CleanupBatchSize:   defaultCleanupBatchSize,
+		CleanupBatchPause:  defaultCleanupBatchPause,
 		MaxEntriesInWindow: 1000 * 10 * 60,
 		MaxEntrySize:       500,
 		StatsEnabled:       false,

@@ -8,7 +8,9 @@ import (
 )
 
 const (
-	minimumEntriesInShard = 10 // Minimum number of entries in single shard
+	minimumEntriesInShard    = 10 // Minimum number of entries in single shard
+	defaultCleanupBatchSize  = 1024
+	defaultCleanupBatchPause = time.Millisecond
 )
 
 // BigCache is fast, concurrent, evicting cache created to keep big number of entries without impact on performance.
@@ -71,6 +73,18 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 	if config.HardMaxCacheSize < 0 {
 		return nil, errors.New("HardMaxCacheSize must be >= 0")
 	}
+	if config.CleanupBatchSize < 0 {
+		return nil, errors.New("CleanupBatchSize must be >= 0")
+	}
+	if config.CleanupBatchPause < 0 {
+		return nil, errors.New("CleanupBatchPause must be >= 0")
+	}
+	if config.CleanupBatchSize == 0 {
+		config.CleanupBatchSize = defaultCleanupBatchSize
+	}
+	if config.CleanupBatchPause == 0 {
+		config.CleanupBatchPause = defaultCleanupBatchPause
+	}
 
 	lifeWindowSeconds := uint64(config.LifeWindow.Seconds())
 	if config.CleanWindow > 0 && lifeWindowSeconds == 0 {
@@ -115,7 +129,7 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 				case <-ctx.Done():
 					return
 				case t := <-ticker.C:
-					cache.cleanUp(uint64(t.Unix()))
+					cache.cleanUpPaced(ctx, uint64(t.Unix()))
 				case <-cache.close:
 					return
 				}
@@ -253,6 +267,40 @@ func (c *BigCache) onEvict(oldestEntry []byte, currentTimestamp uint64, evict fu
 func (c *BigCache) cleanUp(currentTimestamp uint64) {
 	for _, shard := range c.shards {
 		shard.cleanUp(currentTimestamp)
+	}
+}
+
+func (c *BigCache) cleanUpPaced(ctx context.Context, currentTimestamp uint64) {
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
+	for _, shard := range c.shards {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.close:
+				return
+			default:
+			}
+
+			removed, hasMore := shard.cleanUpBatch(currentTimestamp, c.config.CleanupBatchSize)
+			if removed == 0 || !hasMore {
+				break
+			}
+
+			timer.Reset(c.config.CleanupBatchPause)
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.close:
+				return
+			case <-timer.C:
+			}
+		}
 	}
 }
 

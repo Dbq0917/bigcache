@@ -2,6 +2,7 @@ package bigcache
 
 import (
 	"errors"
+	"runtime"
 	"sync"
 
 	"github.com/allegro/bigcache/v3/queue"
@@ -289,15 +290,30 @@ func (s *cacheShard) isExpired(oldestEntry []byte, currentTimestamp uint64) bool
 }
 
 func (s *cacheShard) cleanUp(currentTimestamp uint64) {
-	s.lock.Lock()
 	for {
-		if oldestEntry, err := s.entries.Peek(); err != nil {
-			break
-		} else if evicted := s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry); !evicted {
-			break
+		removed, hasMore := s.cleanUpBatch(currentTimestamp, defaultCleanupBatchSize)
+		if removed == 0 || !hasMore {
+			return
 		}
+		runtime.Gosched()
 	}
-	s.lock.Unlock()
+}
+
+func (s *cacheShard) cleanUpBatch(currentTimestamp uint64, batchSize int) (removed int, hasMore bool) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	for removed < batchSize {
+		if oldestEntry, err := s.entries.Peek(); err != nil {
+			return removed, false
+		} else if evicted := s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry); !evicted {
+			return removed, false
+		}
+		removed++
+	}
+
+	oldestEntry, err := s.entries.Peek()
+	return removed, err == nil && s.isExpired(oldestEntry, currentTimestamp)
 }
 
 func (s *cacheShard) getEntry(hashedKey uint64) ([]byte, error) {

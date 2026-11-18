@@ -3,9 +3,9 @@ package bigcache
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"math"
-	"crypto/rand"
 	mrand "math/rand/v2"
 	"runtime"
 	"strings"
@@ -214,6 +214,14 @@ func TestNewBigcacheValidation(t *testing.T) {
 			cfg:  Config{Shards: 16, HardMaxCacheSize: -1},
 			want: "HardMaxCacheSize must be >= 0",
 		},
+		{
+			cfg:  Config{Shards: 16, CleanupBatchSize: -1},
+			want: "CleanupBatchSize must be >= 0",
+		},
+		{
+			cfg:  Config{Shards: 16, CleanupBatchPause: -1},
+			want: "CleanupBatchPause must be >= 0",
+		},
 	} {
 		t.Run(tc.want, func(t *testing.T) {
 			cache, error := New(context.Background(), tc.cfg)
@@ -315,6 +323,70 @@ func TestCleanShouldEvictAll(t *testing.T) {
 	// then
 	assertEqual(t, ErrEntryNotFound, err)
 	assertEqual(t, value, []byte(nil))
+}
+
+func TestCleanUpRemovesExpiredEntriesInBatches(t *testing.T) {
+	clock := mockedClock{value: 0}
+	cache, err := newBigCache(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         time.Second,
+		CleanWindow:        0,
+		CleanupBatchSize:   2,
+		MaxEntriesInWindow: 16,
+		MaxEntrySize:       32,
+	}, &clock)
+	noError(t, err)
+
+	for i := 0; i < 7; i++ {
+		noError(t, cache.Set(fmt.Sprintf("key_%d", i), []byte("value")))
+	}
+	clock.set(5)
+
+	shard := cache.shards[0]
+	for i := 0; i < 3; i++ {
+		removed, hasMore := shard.cleanUpBatch(uint64(clock.Epoch()), 2)
+		assertEqual(t, 2, removed)
+		assertEqual(t, true, hasMore)
+		assertEqual(t, 7-(i+1)*2, cache.Len())
+	}
+
+	removed, hasMore := shard.cleanUpBatch(uint64(clock.Epoch()), 2)
+	assertEqual(t, 1, removed)
+	assertEqual(t, false, hasMore)
+	assertEqual(t, 0, cache.Len())
+}
+
+func TestCleanUpResumesFromQueueHeadAfterCancellation(t *testing.T) {
+	clock := mockedClock{value: 0}
+	ctx, cancel := context.WithCancel(context.Background())
+	var removed int
+	cache, err := newBigCache(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         time.Second,
+		CleanWindow:        0,
+		CleanupBatchSize:   2,
+		CleanupBatchPause:  time.Hour,
+		MaxEntriesInWindow: 16,
+		MaxEntrySize:       32,
+		OnRemoveWithReason: func(key string, entry []byte, reason RemoveReason) {
+			removed++
+			cancel()
+		},
+	}, &clock)
+	noError(t, err)
+
+	for i := 0; i < 7; i++ {
+		noError(t, cache.Set(fmt.Sprintf("key_%d", i), []byte("value")))
+	}
+	clock.set(5)
+
+	cache.cleanUpPaced(ctx, uint64(clock.Epoch()))
+	assertEqual(t, 2, removed)
+	assertEqual(t, 5, cache.Len())
+
+	cache.cleanUp(uint64(clock.Epoch()))
+	assertEqual(t, 7, removed)
+	assertEqual(t, 0, cache.Len())
 }
 
 func TestOnRemoveCallback(t *testing.T) {
@@ -1470,16 +1542,16 @@ func FuzzBigCache(f *testing.F) {
 	f.Add([]byte{
 		0, 1, 255, 0, 0, 99, // config: 1 shard, 1MB, entrySize=256, life=1s, clean=0, entries=100
 		0, 3, 'k', '1', 5, 'v', 'a', 'l', '1', '!', // Set "k1" = "val1!"
-		0, 3, 'k', '2', 3, 'a', 'b', 'c',             // Set "k2" = "abc"
-		1, 3, 'k', '1',                                 // Get "k1"
-		2, 3, 'k', '1',                                 // Delete "k1"
-		0, 3, 'k', '3', 200, 'x',                       // Set "k3" (val truncated)
+		0, 3, 'k', '2', 3, 'a', 'b', 'c', // Set "k2" = "abc"
+		1, 3, 'k', '1', // Get "k1"
+		2, 3, 'k', '1', // Delete "k1"
+		0, 3, 'k', '3', 200, 'x', // Set "k3" (val truncated)
 	})
 	f.Add([]byte{
 		2, 0, 10, 4, 1, 5, // config: 4 shards, unlimited, entrySize=11, life=5s, clean=1s, entries=6
 		0, 2, 'a', 'b', 3, 'x', 'y', 'z', // Set "ab" = "xyz"
 		0, 2, 'a', 'b', 3, '1', '2', '3', // Set "ab" = "123" (overwrite)
-		1, 2, 'a', 'b',                     // Get "ab"
+		1, 2, 'a', 'b', // Get "ab"
 	})
 
 	f.Fuzz(func(t *testing.T, data []byte) {

@@ -53,6 +53,14 @@ config := bigcache.Config {
 		// Setting to < 1 second is counterproductive — bigcache has a one second resolution.
 		CleanWindow: 5 * time.Minute,
 
+		// Maximum number of expired entries removed while holding a shard's lock.
+		// Cleanup continues in additional batches until the shard is clean.
+		CleanupBatchSize: 1024,
+
+		// Pause between cleanup batches when more expired entries remain.
+		// This bounds cleanup CPU usage and keeps reads and writes responsive.
+		CleanupBatchPause: time.Millisecond,
+
 		// rps * lifeWindow, used only in initial memory allocation
 		MaxEntriesInWindow: 1000 * 10 * 60,
 
@@ -96,6 +104,12 @@ if entry, err := cache.Get("my-unique-key"); err == nil {
 1. `LifeWindow` is a time. After that time, an entry can be called dead but not deleted.
 
 2. `CleanWindow` is a time. After that time, all the dead entries will be deleted, but not the entries that still have life.
+
+Cleanup removes expired entries in small batches. A shard lock is held only for one batch, then
+released for `CleanupBatchPause` before cleanup continues. The queue head is the cleanup cursor,
+so cleanup resumes from the same place if it is interrupted. Lower `CleanupBatchSize` values reduce
+the maximum time reads and writes can wait for a shard; `CleanupBatchPause` controls how much CPU
+cleanup is allowed to use while expired entries remain.
 
 ## [Benchmarks](https://github.com/allegro/bigcache-bench)
 
