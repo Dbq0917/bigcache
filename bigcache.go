@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,59 @@ type BigCache struct {
 	shardMask  uint64
 	close      chan struct{}
 	closeOnce  sync.Once
+	scope      *evictionScope
+}
+
+// evictionScope coordinates cache-wide eviction when Config.GlobalEviction is
+// set. It maintains the shared counters the global scope costs: the total
+// number of live entry bytes and, via cacheShard.headTimestamp, a per-shard
+// view of the oldest entry so a victim can be picked without taking locks.
+type evictionScope struct {
+	bytes     atomic.Int64
+	maxBytes  int64
+	shards    []*cacheShard
+	scanStart atomic.Uint64
+}
+
+// oldestShard returns the shard whose oldest entry has the smallest
+// timestamp, or nil when every shard is empty. Timestamps have one second
+// resolution, so ties are frequent; the scan start rotates to avoid
+// systematically evicting from lower-numbered shards.
+func (s *evictionScope) oldestShard() *cacheShard {
+	n := len(s.shards)
+	start := int(s.scanStart.Add(1) % uint64(n))
+	var victim *cacheShard
+	oldest := int64(-1)
+	for i := 0; i < n; i++ {
+		shard := s.shards[(start+i)%n]
+		ts := shard.headTimestamp.Load()
+		if ts < 0 {
+			continue
+		}
+		if victim == nil || ts < oldest {
+			oldest = ts
+			victim = shard
+		}
+	}
+	return victim
+}
+
+// evictUntilUnderLimit evicts globally oldest entries until the shared byte
+// budget is met. It must not be called while holding a shard lock.
+func (s *evictionScope) evictUntilUnderLimit() {
+	for s.bytes.Load() > s.maxBytes {
+		victim := s.oldestShard()
+		if victim == nil {
+			return
+		}
+		victim.lock.Lock()
+		err := victim.removeOldestEntry(NoSpace)
+		victim.lock.Unlock()
+		if err != nil {
+			// Lost a race with another evictor, re-check the budget.
+			continue
+		}
+	}
 }
 
 // Response will contain metadata about the entry for which GetWithInfo(key) was called
@@ -71,6 +125,9 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 	if config.HardMaxCacheSize < 0 {
 		return nil, errors.New("HardMaxCacheSize must be >= 0")
 	}
+	if config.GlobalEviction && config.HardMaxCacheSize <= 0 {
+		return nil, errors.New("GlobalEviction requires HardMaxCacheSize > 0")
+	}
 
 	lifeWindowSeconds := uint64(config.LifeWindow.Seconds())
 	if config.CleanWindow > 0 && lifeWindowSeconds == 0 {
@@ -102,8 +159,15 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 		onRemove = cache.notProvidedOnRemove
 	}
 
+	if config.GlobalEviction {
+		cache.scope = &evictionScope{
+			maxBytes: int64(convertMBToBytes(config.HardMaxCacheSize)),
+			shards:   cache.shards,
+		}
+	}
+
 	for i := 0; i < config.Shards; i++ {
-		cache.shards[i] = initNewShard(config, onRemove, clock)
+		cache.shards[i] = initNewShard(config, onRemove, clock, cache.scope)
 	}
 
 	if config.CleanWindow > 0 {
@@ -182,6 +246,9 @@ func (c *BigCache) Delete(key string) error {
 func (c *BigCache) Reset() error {
 	for _, shard := range c.shards {
 		shard.reset(c.config)
+	}
+	if c.scope != nil {
+		c.scope.bytes.Store(0)
 	}
 	return nil
 }

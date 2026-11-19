@@ -30,6 +30,20 @@ type Config struct {
 	// and statistics (map[uint64]uint32) the size of this map is equal to number of entries in
 	// cache ~ 2×(64+32)×n bits + overhead or map itself.
 	HardMaxCacheSize int
+	// GlobalEviction changes the eviction scope from shard-local to cache-wide.
+	// It requires HardMaxCacheSize > 0.
+	// When false (default) every shard evicts its own oldest entry and the byte
+	// budget is enforced as HardMaxCacheSize/Shards per shard. This keeps
+	// eviction O(1) and needs no shared state, but hot keys concentrated on a
+	// few shards are evicted while other shards sit idle.
+	// When true all shards share one byte budget (HardMaxCacheSize in total):
+	// a hot shard may grow beyond its 1/Shards share and the evicted victim is
+	// the globally oldest entry across all shards. This protects skewed hot
+	// keys at the cost of maintaining extra shared counters (a global byte
+	// counter and per-shard oldest-entry timestamps updated on every
+	// push/pop), an O(Shards) victim scan on eviction, and a looser memory
+	// bound, because allocated queue buffers are never returned to the OS.
+	GlobalEviction bool
 	// OnRemove is a callback fired when the oldest entry is removed because of its expiration time or no space left
 	// for the new entry, or because delete was called.
 	// Default value is nil which means no callback and it prevents from unwrapping the oldest entry.
