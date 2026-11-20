@@ -1,11 +1,17 @@
 package bigcache
 
 import (
+	"encoding/binary"
 	"errors"
 	"sync"
 
 	"github.com/allegro/bigcache/v3/queue"
 )
+
+// bigEntryShardFraction determines when an entry is considered big compared to
+// the maximum shard size. Entries bigger than maximumShardSizeInBytes/bigEntryShardFraction
+// are stored outside of the entries queue so they cannot evict smaller entries.
+const bigEntryShardFraction = 4
 
 type onRemoveCallback func(wrappedEntry []byte, reason RemoveReason)
 
@@ -17,19 +23,51 @@ type Metadata struct {
 type cacheShard struct {
 	hashmap     map[uint64]uint64
 	entries     queue.BytesQueue
+	bigEntries  map[uint64][]byte
 	lock        sync.RWMutex
 	entryBuffer []byte
 	onRemove    onRemoveCallback
 
-	isVerbose    bool
-	statsEnabled bool
-	logger       Logger
-	clock        clock
-	lifeWindow   uint64
+	isVerbose           bool
+	statsEnabled        bool
+	logger              Logger
+	clock               clock
+	lifeWindow          uint64
+	maxEntrySizeInQueue int
 
 	hashmapStats map[uint64]uint32
 	stats        shardStats
 	cleanEnabled bool
+}
+
+// readEntry unwraps the entry and, when the entry payload was stored outside
+// of the queue, resolves it from bigEntries. Must be called under lock.
+func (s *cacheShard) readEntry(wrappedEntry []byte, hashedKey uint64) []byte {
+	entry := readEntry(wrappedEntry)
+	if len(entry) == 0 && s.bigEntries != nil {
+		if payload, ok := s.bigEntries[hashedKey]; ok {
+			entry = make([]byte, len(payload))
+			copy(entry, payload)
+		}
+	}
+	return entry
+}
+
+// detachBigEntry removes the offloaded payload for hash (if any) and returns
+// the full wrapped entry with the payload appended back. Must be called under lock.
+func (s *cacheShard) detachBigEntry(wrappedEntry []byte, hash uint64) []byte {
+	if s.bigEntries == nil {
+		return wrappedEntry
+	}
+	payload, ok := s.bigEntries[hash]
+	if !ok {
+		return wrappedEntry
+	}
+	delete(s.bigEntries, hash)
+	full := make([]byte, len(wrappedEntry)+len(payload))
+	copy(full, wrappedEntry)
+	copy(full[len(wrappedEntry):], payload)
+	return full
 }
 
 func (s *cacheShard) getWithInfo(key string, hashedKey uint64) (entry []byte, resp Response, err error) {
@@ -49,7 +87,7 @@ func (s *cacheShard) getWithInfo(key string, hashedKey uint64) (entry []byte, re
 		return nil, resp, ErrEntryNotFound
 	}
 
-	entry = readEntry(wrappedEntry)
+	entry = s.readEntry(wrappedEntry, hashedKey)
 	if s.isExpired(wrappedEntry, currentTime) {
 		resp.EntryStatus = Expired
 	}
@@ -73,7 +111,7 @@ func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
 		}
 		return nil, ErrEntryNotFound
 	}
-	entry := readEntry(wrappedEntry)
+	entry := s.readEntry(wrappedEntry, hashedKey)
 	s.lock.RUnlock()
 	s.hit(hashedKey)
 
@@ -126,6 +164,9 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 			resetHashFromEntry(previousEntry)
 			//remove hashkey
 			delete(s.hashmap, hashedKey)
+			if s.bigEntries != nil {
+				delete(s.bigEntries, hashedKey)
+			}
 		}
 	}
 
@@ -137,17 +178,9 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 
 	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer)
 
-	for {
-		if index, err := s.entries.Push(w); err == nil {
-			s.hashmap[hashedKey] = uint64(index)
-			s.lock.Unlock()
-			return nil
-		}
-		if s.removeOldestEntry(NoSpace) != nil {
-			s.lock.Unlock()
-			return errors.New("entry is bigger than max shard size")
-		}
-	}
+	err := s.pushWrappedEntry(w, hashedKey)
+	s.lock.Unlock()
+	return err
 }
 
 func (s *cacheShard) addNewWithoutLock(key string, hashedKey uint64, entry []byte) error {
@@ -161,6 +194,36 @@ func (s *cacheShard) addNewWithoutLock(key string, hashedKey uint64, entry []byt
 
 	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer)
 
+	return s.pushWrappedEntry(w, hashedKey)
+}
+
+func (s *cacheShard) setWrappedEntryWithoutLock(currentTimestamp uint64, w []byte, hashedKey uint64) error {
+	if previousIndex := s.hashmap[hashedKey]; previousIndex != 0 {
+		if previousEntry, err := s.entries.Get(int(previousIndex)); err == nil {
+			resetHashFromEntry(previousEntry)
+			if s.bigEntries != nil {
+				delete(s.bigEntries, hashedKey)
+			}
+		}
+	}
+
+	if !s.cleanEnabled {
+		if oldestEntry, err := s.entries.Peek(); err == nil {
+			s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry)
+		}
+	}
+
+	return s.pushWrappedEntry(w, hashedKey)
+}
+
+// pushWrappedEntry stores the wrapped entry in the shard. Entries bigger than
+// maxEntrySizeInQueue are split: only headers and key are kept in the entries
+// queue (preserving FIFO order, expiration and collision detection), while the
+// payload is placed in bigEntries so it cannot evict smaller entries.
+func (s *cacheShard) pushWrappedEntry(w []byte, hashedKey uint64) error {
+	if s.maxEntrySizeInQueue > 0 && len(w) > s.maxEntrySizeInQueue {
+		return s.pushBigEntry(w, hashedKey)
+	}
 	for {
 		if index, err := s.entries.Push(w); err == nil {
 			s.hashmap[hashedKey] = uint64(index)
@@ -172,22 +235,21 @@ func (s *cacheShard) addNewWithoutLock(key string, hashedKey uint64, entry []byt
 	}
 }
 
-func (s *cacheShard) setWrappedEntryWithoutLock(currentTimestamp uint64, w []byte, hashedKey uint64) error {
-	if previousIndex := s.hashmap[hashedKey]; previousIndex != 0 {
-		if previousEntry, err := s.entries.Get(int(previousIndex)); err == nil {
-			resetHashFromEntry(previousEntry)
-		}
-	}
-
-	if !s.cleanEnabled {
-		if oldestEntry, err := s.entries.Peek(); err == nil {
-			s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry)
-		}
-	}
+func (s *cacheShard) pushBigEntry(w []byte, hashedKey uint64) error {
+	keyLength := int(binary.LittleEndian.Uint16(w[timestampSizeInBytes+hashSizeInBytes:]))
+	payloadOffset := headersSizeInBytes + keyLength
+	// w reuses the shared entry buffer, the payload must be copied out
+	payload := make([]byte, len(w)-payloadOffset)
+	copy(payload, w[payloadOffset:])
+	placeholder := w[:payloadOffset]
 
 	for {
-		if index, err := s.entries.Push(w); err == nil {
+		if index, err := s.entries.Push(placeholder); err == nil {
 			s.hashmap[hashedKey] = uint64(index)
+			if s.bigEntries == nil {
+				s.bigEntries = make(map[uint64][]byte)
+			}
+			s.bigEntries[hashedKey] = payload
 			return nil
 		}
 		if s.removeOldestEntry(NoSpace) != nil {
@@ -211,6 +273,16 @@ func (s *cacheShard) append(key string, hashedKey uint64, entry []byte) error {
 	}
 
 	currentTimestamp := uint64(s.clock.Epoch())
+
+	if s.bigEntries != nil {
+		if payload, ok := s.bigEntries[hashedKey]; ok {
+			// reattach the offloaded payload so the appended entry is complete
+			full := make([]byte, len(wrappedEntry)+len(payload))
+			copy(full, wrappedEntry)
+			copy(full[len(wrappedEntry):], payload)
+			wrappedEntry = full
+		}
+	}
 
 	w := appendToWrappedEntry(currentTimestamp, wrappedEntry, entry, &s.entryBuffer)
 
@@ -260,7 +332,7 @@ func (s *cacheShard) del(hashedKey uint64) error {
 		}
 
 		delete(s.hashmap, hashedKey)
-		s.onRemove(wrappedEntry, Deleted)
+		s.onRemove(s.detachBigEntry(wrappedEntry, hashedKey), Deleted)
 		if s.statsEnabled {
 			delete(s.hashmapStats, hashedKey)
 		}
@@ -307,6 +379,14 @@ func (s *cacheShard) getEntry(hashedKey uint64) ([]byte, error) {
 	// copy entry
 	newEntry := make([]byte, len(entry))
 	copy(newEntry, entry)
+	if err == nil && s.bigEntries != nil {
+		if payload, ok := s.bigEntries[hashedKey]; ok {
+			full := make([]byte, len(newEntry)+len(payload))
+			copy(full, newEntry)
+			copy(full[len(newEntry):], payload)
+			newEntry = full
+		}
+	}
 
 	s.lock.RUnlock()
 
@@ -335,7 +415,7 @@ func (s *cacheShard) removeOldestEntry(reason RemoveReason) error {
 			return nil
 		}
 		delete(s.hashmap, hash)
-		s.onRemove(oldest, reason)
+		s.onRemove(s.detachBigEntry(oldest, hash), reason)
 		if s.statsEnabled {
 			delete(s.hashmapStats, hash)
 		}
@@ -353,6 +433,7 @@ func (s *cacheShard) reset(config Config) {
 	s.hashmap = make(map[uint64]uint64, config.initialShardSize())
 	s.hashmapStats = make(map[uint64]uint32, hashmapStatsCapacity)
 	s.entryBuffer = make([]byte, config.MaxEntrySize+headersSizeInBytes)
+	s.bigEntries = nil
 	s.entries.Reset()
 	s.lock.Unlock()
 }
@@ -447,6 +528,10 @@ func initNewShard(config Config, callback onRemoveCallback, clock clock) *cacheS
 	if config.StatsEnabled {
 		hashmapStatsCapacity = config.initialShardSize()
 	}
+	maxEntrySizeInQueue := 0
+	if maximumShardSizeInBytes > 0 {
+		maxEntrySizeInQueue = maximumShardSizeInBytes / bigEntryShardFraction
+	}
 	return &cacheShard{
 		hashmap:      make(map[uint64]uint64, config.initialShardSize()),
 		hashmapStats: make(map[uint64]uint32, hashmapStatsCapacity),
@@ -454,11 +539,12 @@ func initNewShard(config Config, callback onRemoveCallback, clock clock) *cacheS
 		entryBuffer:  make([]byte, config.MaxEntrySize+headersSizeInBytes),
 		onRemove:     callback,
 
-		isVerbose:    config.Verbose,
-		logger:       newLogger(config.Logger),
-		clock:        clock,
-		lifeWindow:   uint64(config.LifeWindow.Seconds()),
-		statsEnabled: config.StatsEnabled,
-		cleanEnabled: config.CleanWindow > 0,
+		isVerbose:           config.Verbose,
+		logger:              newLogger(config.Logger),
+		clock:               clock,
+		lifeWindow:          uint64(config.LifeWindow.Seconds()),
+		statsEnabled:        config.StatsEnabled,
+		cleanEnabled:        config.CleanWindow > 0,
+		maxEntrySizeInQueue: maxEntrySizeInQueue,
 	}
 }

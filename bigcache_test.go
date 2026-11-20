@@ -650,6 +650,81 @@ func TestCacheStats(t *testing.T) {
 	assertEqual(t, stats.DelHits, int64(10))
 	assertEqual(t, stats.DelMisses, int64(10))
 }
+
+func TestCacheStatsWithMixedLargeValues(t *testing.T) {
+	t.Parallel()
+
+	// given
+	cache, _ := New(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         100 * time.Second,
+		MaxEntriesInWindow: 1100,
+		MaxEntrySize:       64,
+		HardMaxCacheSize:   1,
+	})
+
+	// when
+	// small values, e.g. log lines of a few dozen bytes
+	for i := 0; i < 1000; i++ {
+		cache.Set(fmt.Sprintf("log-%d", i), blob(byte('a'+i%26), 40))
+	}
+	// a few large values, e.g. avatars of a few hundred KB
+	for i := 0; i < 5; i++ {
+		cache.Set(fmt.Sprintf("avatar-%d", i), blob('z', 300*1024))
+	}
+	// more small values written after the large ones
+	for i := 1000; i < 1100; i++ {
+		cache.Set(fmt.Sprintf("log-%d", i), blob(byte('a'+i%26), 40))
+	}
+
+	for i := 0; i < 1100; i++ {
+		_, err := cache.Get(fmt.Sprintf("log-%d", i))
+		noError(t, err)
+	}
+	for i := 0; i < 5; i++ {
+		value, err := cache.Get(fmt.Sprintf("avatar-%d", i))
+		noError(t, err)
+		assertEqual(t, 300*1024, len(value))
+	}
+
+	// then
+	// large values must not evict small entries, every read is a hit
+	stats := cache.Stats()
+	assertEqual(t, int64(1105), stats.Hits)
+	assertEqual(t, int64(0), stats.Misses)
+	assertEqual(t, 1105, cache.Len())
+}
+
+func TestAppendAndDeleteOnEntryStoredOutsideQueue(t *testing.T) {
+	t.Parallel()
+
+	// given
+	var removed []byte
+	cache, _ := New(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         100 * time.Second,
+		MaxEntriesInWindow: 1,
+		MaxEntrySize:       1,
+		HardMaxCacheSize:   1,
+		OnRemove:           func(key string, entry []byte) { removed = entry },
+	})
+
+	big := blob('b', 300*1024)
+	cache.Set("big", big)
+
+	// when
+	cache.Append("big", []byte("-tail"))
+	cachedValue, err := cache.Get("big")
+
+	// then
+	noError(t, err)
+	assertEqual(t, append(big, []byte("-tail")...), cachedValue)
+
+	// and when deleted, OnRemove receives the full value
+	err = cache.Delete("big")
+	noError(t, err)
+	assertEqual(t, append(big, []byte("-tail")...), removed)
+}
 func TestCacheEntryStats(t *testing.T) {
 	t.Parallel()
 
@@ -1024,18 +1099,20 @@ func TestOldestEntryDeletionWhenMaxCacheSizeIsReached(t *testing.T) {
 	})
 
 	// when
-	cache.Set("key1", blob('a', 1024*400))
-	cache.Set("key2", blob('b', 1024*400))
-	cache.Set("key3", blob('c', 1024*800))
+	// entries are kept below the big entry threshold (1/4 of max shard size)
+	// so they stay in the shard queue and evict each other in FIFO order
+	cache.Set("key1", blob('a', 1024*250))
+	cache.Set("key2", blob('b', 1024*250))
+	cache.Set("key3", blob('c', 1024*250))
+	cache.Set("key4", blob('d', 1024*250))
+	cache.Set("key5", blob('e', 1024*250))
 
 	_, key1Err := cache.Get("key1")
-	_, key2Err := cache.Get("key2")
-	entry3, _ := cache.Get("key3")
+	entry5, _ := cache.Get("key5")
 
 	// then
 	assertEqual(t, key1Err, ErrEntryNotFound)
-	assertEqual(t, key2Err, ErrEntryNotFound)
-	assertEqual(t, blob('c', 1024*800), entry3)
+	assertEqual(t, blob('e', 1024*250), entry5)
 }
 
 func TestRetrievingEntryShouldCopy(t *testing.T) {
@@ -1049,22 +1126,24 @@ func TestRetrievingEntryShouldCopy(t *testing.T) {
 		MaxEntrySize:       1,
 		HardMaxCacheSize:   1,
 	})
-	cache.Set("key1", blob('a', 1024*400))
+	// entries are kept below the big entry threshold (1/4 of max shard size)
+	// so they stay in the shard queue and overwrite each other on eviction
+	cache.Set("key1", blob('a', 1024*250))
 	value, key1Err := cache.Get("key1")
 
 	// when
 	// override queue
-	cache.Set("key2", blob('b', 1024*400))
-	cache.Set("key3", blob('c', 1024*400))
-	cache.Set("key4", blob('d', 1024*400))
-	cache.Set("key5", blob('d', 1024*400))
+	cache.Set("key2", blob('b', 1024*250))
+	cache.Set("key3", blob('c', 1024*250))
+	cache.Set("key4", blob('d', 1024*250))
+	cache.Set("key5", blob('d', 1024*250))
 
 	// then
 	noError(t, key1Err)
-	assertEqual(t, blob('a', 1024*400), value)
+	assertEqual(t, blob('a', 1024*250), value)
 }
 
-func TestEntryBiggerThanMaxShardSizeError(t *testing.T) {
+func TestEntryBiggerThanMaxShardSizeIsStoredOutsideQueue(t *testing.T) {
 	t.Parallel()
 
 	// given
@@ -1080,7 +1159,10 @@ func TestEntryBiggerThanMaxShardSizeError(t *testing.T) {
 	err := cache.Set("key1", blob('a', 1024*1025))
 
 	// then
-	assertEqual(t, "entry is bigger than max shard size", err.Error())
+	noError(t, err)
+	cachedValue, err := cache.Get("key1")
+	noError(t, err)
+	assertEqual(t, blob('a', 1024*1025), cachedValue)
 }
 
 func TestHashCollision(t *testing.T) {

@@ -272,7 +272,7 @@ func TestCacheIndexHandler(t *testing.T) {
 	}
 }
 
-func TestInvalidPutWhenExceedShardCap(t *testing.T) {
+func TestPutWhenExceedShardCap(t *testing.T) {
 	t.Parallel()
 	req := httptest.NewRequest("PUT", testBaseString+"/api/v1/cache/putKey", bytes.NewBuffer(bytes.Repeat([]byte("a"), 8*1024*1024)))
 	rr := httptest.NewRecorder()
@@ -280,8 +280,17 @@ func TestInvalidPutWhenExceedShardCap(t *testing.T) {
 	putCacheHandler(rr, req)
 	resp := rr.Result()
 
-	if resp.StatusCode != 500 {
-		t.Errorf("want: 500; got: %d", resp.StatusCode)
+	// entries bigger than the shard queue are stored outside of it
+	if resp.StatusCode != 201 {
+		t.Errorf("want: 201; got: %d", resp.StatusCode)
+	}
+
+	testPutKeyResult, err := cache.Get("putKey")
+	if err != nil {
+		t.Errorf("error retrieving putKey: %s", err)
+	}
+	if len(testPutKeyResult) != 8*1024*1024 {
+		t.Errorf("want: %d; got: %d", 8*1024*1024, len(testPutKeyResult))
 	}
 }
 
