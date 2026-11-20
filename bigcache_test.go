@@ -875,6 +875,72 @@ func TestWriteAndReadParallelSameKeyWithStats(t *testing.T) {
 	assertEqual(t, ntest*n, int(cache.KeyMetadata(key).RequestCount))
 }
 
+// TestConcurrentReadWriteVariableLengthSameKey stresses overwriting the same key
+// with values of different lengths and contents. A reader must always observe a
+// complete value (either the old or the new one), never a torn entry where the
+// index points at a reused block whose length header no longer matches the data.
+func TestConcurrentReadWriteVariableLengthSameKey(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultConfig(10 * time.Second)
+	// single shard keeps every overwrite in the same FIFO bytes queue, so old
+	// blocks are reused and mismatched length headers would be exposed.
+	config.Shards = 1
+	config.HardMaxCacheSize = 1
+
+	cache, err := New(context.Background(), config)
+	noError(t, err)
+
+	key := "key"
+	values := [][]byte{
+		blob('a', 16),
+		blob('b', 4096),
+		blob('c', 1),
+		blob('d', 777),
+		blob('e', 2048),
+	}
+	validWrites := make(map[string]bool, len(values))
+	for _, value := range values {
+		validWrites[string(value)] = true
+	}
+	noError(t, cache.Set(key, values[0]))
+
+	const iterations = 20000
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			value := values[int(mrand.Int64())%len(values)]
+			if err := cache.Set(key, value); err != nil {
+				t.Errorf("unexpected set error: %v", err)
+				return
+			}
+		}
+	}()
+
+	for reader := 0; reader < 4; reader++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				got, err := cache.Get(key)
+				if err != nil {
+					t.Errorf("unexpected get error: %v", err)
+					return
+				}
+				if !validWrites[string(got)] {
+					t.Errorf("torn/partial read for %q: got %d bytes: %x", key, len(got), got)
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
 func TestCacheReset(t *testing.T) {
 	t.Parallel()
 
