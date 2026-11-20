@@ -95,7 +95,40 @@ if entry, err := cache.Get("my-unique-key"); err == nil {
 
 1. `LifeWindow` is a time. After that time, an entry can be called dead but not deleted.
 
-2. `CleanWindow` is a time. After that time, all the dead entries will be deleted, but not the entries that still have life.
+2. `CleanWindow` is a time. After that time, the dead entries will be deleted, but not the entries that still have life.
+
+### Adaptive cleaning
+
+A fixed-period sweeper has two failure modes under peak write traffic: a long interval lets
+expired entries accumulate and drive memory growth (eventually OOM), while a short interval
+performs bulk sweeps that hold shard locks and compete with writers for CPU. BigCache therefore
+runs an **adaptive, write-driven cleaner**:
+
+- Writers nudge the cleaner periodically (`Set`/`Append`), and `CleanWindow` remains a
+  safety-net ticker so expiration is still reclaimed when traffic goes quiet.
+- Each cleaning pass evicts a bounded number of expired entries per shard (`CleanBatchSize`,
+  default 4096) instead of sweeping a shard for an unbounded time, and the per-shard budget
+  scales with the write rate observed since the previous pass (hard-capped at 65536). This keeps
+  cleaning capacity ahead of expiration while every shard lock stays held only briefly.
+- A read-lock probe skips shards whose head entry is still alive, so frequent wake-ups do not
+  turn into write-lock contention, and the cleaner yields between shard batches.
+- When a pass leaves a substantial backlog behind, the cleaner re-arms itself (throttled to at
+  most one sweep per 5ms) to drain the surplus even after the write burst has stopped.
+
+Set `CleanBatchSize: -1` to restore the legacy behavior of evicting every expired entry in one
+pass per shard.
+
+### Cleaning observability
+
+`Stats()` exposes three counters for monitoring whether the cleaner keeps up with writes:
+
+- `clean_runs` — number of per-shard cleaning passes performed.
+- `cleaned_entries` — total expired entries reclaimed by the background cleaner.
+- `clean_backlog` — queued entries unreachable from the live key index (overwritten/deleted
+  bytes still occupying the FIFO queue).
+- `expired_backlog` — entries whose `LifeWindow` has elapsed but which have not yet been
+  reclaimed. A flat or shrinking value means cleaning keeps up; sustained growth means
+  expiration outruns cleaning and memory will climb.
 
 ## [Benchmarks](https://github.com/allegro/bigcache-bench)
 

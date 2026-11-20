@@ -3,7 +3,9 @@ package bigcache
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,14 +17,24 @@ const (
 // It keeps entries on heap but omits GC for them. To achieve that, operations take place on byte arrays,
 // therefore entries (de)serialization in front of the cache will be needed in most use cases.
 type BigCache struct {
-	shards     []*cacheShard
-	lifeWindow uint64
-	clock      clock
-	hash       Hasher
-	config     Config
-	shardMask  uint64
-	close      chan struct{}
-	closeOnce  sync.Once
+	shards          []*cacheShard
+	lifeWindow      uint64
+	clock           clock
+	hash            Hasher
+	config          Config
+	shardMask       uint64
+	close           chan struct{}
+	closeOnce       sync.Once
+	cleaner         cleanerStats
+	writes          atomic.Uint64
+	cleanNotify     chan struct{}
+	lastClean       time.Time
+	sweepOffset     int
+	lastSweepWrites uint64
+	// disableWriteDrivenCleaning is a test-only switch: when true the cleaner only
+	// wakes up on the CleanWindow ticker, emulating the legacy fixed-period sweeper
+	// for before/after load comparisons.
+	disableWriteDrivenCleaning bool
 }
 
 // Response will contain metadata about the entry for which GetWithInfo(key) was called
@@ -71,6 +83,9 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 	if config.HardMaxCacheSize < 0 {
 		return nil, errors.New("HardMaxCacheSize must be >= 0")
 	}
+	if config.CleanBatchSize < cleanUnlimited {
+		return nil, errors.New("CleanBatchSize must be >= -1")
+	}
 
 	lifeWindowSeconds := uint64(config.LifeWindow.Seconds())
 	if config.CleanWindow > 0 && lifeWindowSeconds == 0 {
@@ -107,6 +122,7 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 	}
 
 	if config.CleanWindow > 0 {
+		cache.cleanNotify = make(chan struct{}, 1)
 		go func() {
 			ticker := time.NewTicker(config.CleanWindow)
 			defer ticker.Stop()
@@ -115,7 +131,12 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 				case <-ctx.Done():
 					return
 				case t := <-ticker.C:
-					cache.cleanUp(uint64(t.Unix()))
+					cache.lastClean = t
+					if cache.cleaningPass(uint64(t.Unix())) {
+						cache.rearmCleaner()
+					}
+				case <-cache.cleanNotify:
+					cache.cleanOnDemand()
 				case <-cache.close:
 					return
 				}
@@ -159,7 +180,11 @@ func (c *BigCache) GetWithInfo(key string) ([]byte, Response, error) {
 func (c *BigCache) Set(key string, entry []byte) error {
 	hashedKey := c.hash.Sum64(key)
 	shard := c.getShard(hashedKey)
-	return shard.set(key, hashedKey, entry)
+	err := shard.set(key, hashedKey, entry)
+	if err == nil {
+		c.notifyCleaner()
+	}
+	return err
 }
 
 // Append appends entry under the key if key exists, otherwise
@@ -168,7 +193,11 @@ func (c *BigCache) Set(key string, entry []byte) error {
 func (c *BigCache) Append(key string, entry []byte) error {
 	hashedKey := c.hash.Sum64(key)
 	shard := c.getShard(hashedKey)
-	return shard.append(key, hashedKey, entry)
+	err := shard.append(key, hashedKey, entry)
+	if err == nil {
+		c.notifyCleaner()
+	}
+	return err
 }
 
 // Delete removes the key
@@ -191,6 +220,8 @@ func (c *BigCache) ResetStats() error {
 	for _, shard := range c.shards {
 		shard.resetStats()
 	}
+	c.cleaner.runs.Store(0)
+	c.cleaner.cleanedEntries.Store(0)
 	return nil
 }
 
@@ -215,6 +246,7 @@ func (c *BigCache) Capacity() int {
 // Stats returns cache's statistics
 func (c *BigCache) Stats() Stats {
 	var s Stats
+	now := uint64(c.clock.Epoch())
 	for _, shard := range c.shards {
 		tmp := shard.getStats()
 		s.Hits += tmp.Hits
@@ -222,7 +254,11 @@ func (c *BigCache) Stats() Stats {
 		s.DelHits += tmp.DelHits
 		s.DelMisses += tmp.DelMisses
 		s.Collisions += tmp.Collisions
+		s.CleanBacklog += int64(shard.cleanBacklog())
+		s.ExpiredBacklog += shard.expiredBacklog(now)
 	}
+	s.CleanRuns = c.cleaner.runs.Load()
+	s.CleanedEntries = c.cleaner.cleanedEntries.Load()
 	return s
 }
 
@@ -253,6 +289,94 @@ func (c *BigCache) onEvict(oldestEntry []byte, currentTimestamp uint64, evict fu
 func (c *BigCache) cleanUp(currentTimestamp uint64) {
 	for _, shard := range c.shards {
 		shard.cleanUp(currentTimestamp)
+	}
+}
+
+// notifyCleaner nudges the background cleaner after write traffic. The signal is
+// coalesced through a capacity-one channel: bursts of writes produce at most one
+// pending wake-up, so the write path only pays for an atomic add plus a
+// non-blocking channel send.
+func (c *BigCache) notifyCleaner() {
+	if c.cleanNotify == nil || c.disableWriteDrivenCleaning || c.writes.Add(1)%cleanWakeupWrites != 0 {
+		return
+	}
+	select {
+	case c.cleanNotify <- struct{}{}:
+	default:
+	}
+}
+
+// cleanOnDemand runs one write-driven incremental sweep. minCleanInterval throttles
+// back-to-back wake-ups so that a saturated write path cannot turn cleaning into a
+// busy loop competing for CPU; the CleanWindow ticker remains a safety net.
+func (c *BigCache) cleanOnDemand() {
+	now := time.Now()
+	if now.Sub(c.lastClean) < minCleanInterval {
+		// Throttled: the CleanWindow ticker remains a safety net for pending work.
+		return
+	}
+	c.lastClean = now
+	if c.cleaningPass(uint64(now.Unix())) {
+		c.rearmCleaner()
+	}
+}
+
+// cleaningPass visits every shard once, evicting at most CleanBatchSize expired
+// entries per shard. Shards are visited from a rotating offset and the goroutine
+// yields between batches, spreading the short lock acquisitions away from writers
+// instead of sweeping one shard for a long time. It returns true when at least one
+// shard hit its batch limit, i.e. expired entries remain and another pass is due.
+func (c *BigCache) cleaningPass(currentTimestamp uint64) bool {
+	configuredBatch := c.config.effectiveCleanBatchSize()
+	shardCount := len(c.shards)
+	c.sweepOffset = (c.sweepOffset + 1) % shardCount
+
+	// Scale the per-shard budget to the observed write rate: entries written since
+	// the previous sweep are the upper bound of what can expire in between sweeps,
+	// so reclaiming at least that many per shard keeps cleaning capacity ahead of
+	// expiration instead of letting backlog grow. A fixed minimum preserves the
+	// configured bound during quiet periods, and a hard cap keeps each lock
+	// acquisition short regardless of burst size.
+	batchSize := configuredBatch
+	if batchSize != cleanUnlimited {
+		currentWrites := c.writes.Load()
+		writesPerShard := int((currentWrites - c.lastSweepWrites) / uint64(shardCount))
+		c.lastSweepWrites = currentWrites
+		batchSize = max(configuredBatch, writesPerShard*2)
+		if batchSize > maxCleanBatchSize {
+			batchSize = maxCleanBatchSize
+		}
+	}
+
+	saturated := false
+	for i := range c.shards {
+		shard := c.shards[(i+c.sweepOffset)%shardCount]
+		evicted := shard.cleanUpBounded(currentTimestamp, batchSize)
+		// Keep self-arming only while a meaningful backlog survives the pass.
+		// Re-arming on every saturated shard would spin the cleaner during ordinary
+		// operation; the write-driven wake-ups and ticker resume sweeping otherwise.
+		if batchSize != cleanUnlimited && shard.expiredBacklog(currentTimestamp) > int64(batchSize) {
+			saturated = true
+		}
+		c.cleaner.cleanedEntries.Add(int64(evicted))
+		c.cleaner.runs.Add(1)
+		if (i+1)%runtime.GOMAXPROCS(0) == 0 {
+			runtime.Gosched()
+		}
+	}
+	return saturated
+}
+
+// rearmCleaner schedules another sweep. Combined with the minCleanInterval throttle
+// in cleanOnDemand this lets the cleaner drain a large expired backlog at a steady,
+// bounded pace even after the write burst that produced it has stopped.
+func (c *BigCache) rearmCleaner() {
+	if c.cleanNotify == nil {
+		return
+	}
+	select {
+	case c.cleanNotify <- struct{}{}:
+	default:
 	}
 }
 

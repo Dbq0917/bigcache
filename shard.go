@@ -30,6 +30,16 @@ type cacheShard struct {
 	hashmapStats map[uint64]uint32
 	stats        shardStats
 	cleanEnabled bool
+	// expiryBuckets counts queued entries grouped by their insertion second.
+	// Entries are FIFO-ordered, so the buckets stay ordered as well and the number
+	// of expired entries still awaiting the cleaner is the sum of head buckets whose
+	// second is older than the life window. All access happens while holding lock.
+	expiryBuckets []expiryBucket
+}
+
+type expiryBucket struct {
+	second int64
+	count  int64
 }
 
 func (s *cacheShard) getWithInfo(key string, hashedKey uint64) (entry []byte, resp Response, err error) {
@@ -139,6 +149,7 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 
 	for {
 		if index, err := s.entries.Push(w); err == nil {
+			s.trackPush(int64(currentTimestamp))
 			s.hashmap[hashedKey] = uint64(index)
 			s.lock.Unlock()
 			return nil
@@ -163,6 +174,7 @@ func (s *cacheShard) addNewWithoutLock(key string, hashedKey uint64, entry []byt
 
 	for {
 		if index, err := s.entries.Push(w); err == nil {
+			s.trackPush(int64(currentTimestamp))
 			s.hashmap[hashedKey] = uint64(index)
 			return nil
 		}
@@ -187,6 +199,7 @@ func (s *cacheShard) setWrappedEntryWithoutLock(currentTimestamp uint64, w []byt
 
 	for {
 		if index, err := s.entries.Push(w); err == nil {
+			s.trackPush(int64(currentTimestamp))
 			s.hashmap[hashedKey] = uint64(index)
 			return nil
 		}
@@ -300,6 +313,107 @@ func (s *cacheShard) cleanUp(currentTimestamp uint64) {
 	s.lock.Unlock()
 }
 
+// cleanUpBounded performs a single incremental cleaning pass. It holds the shard lock
+// only long enough to evict at most maxEntries expired entries, then returns so the
+// cleaner can move on to the next shard instead of blocking writers on one hot shard.
+// A maxEntries value < 0 means no per-pass limit (the legacy full sweep).
+// It returns the number of entries reclaimed during this pass.
+func (s *cacheShard) cleanUpBounded(currentTimestamp uint64, maxEntries int) int {
+	// Fast path: under a read lock only, check whether the head entry has expired.
+	// Most sweeps happen while nothing is due yet; avoiding the write lock in that
+	// case keeps frequent write-driven wake-ups from stalling concurrent writers.
+	s.lock.RLock()
+	oldestEntry, err := s.entries.Peek()
+	if err != nil || !s.isExpired(oldestEntry, currentTimestamp) {
+		s.lock.RUnlock()
+		return 0
+	}
+	s.lock.RUnlock()
+
+	s.lock.Lock()
+	evicted := 0
+	for maxEntries < 0 || evicted < maxEntries {
+		oldestEntry, err := s.entries.Peek()
+		if err != nil {
+			break
+		}
+		if !s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry) {
+			break
+		}
+		evicted++
+	}
+	s.lock.Unlock()
+	return evicted
+}
+
+// cleanBacklog reports how many queued entries are not reachable from the live key
+// index. Besides expired entries it also covers overwritten or explicitly deleted
+// entries whose bytes remain in the FIFO queue until the head catches up with them.
+func (s *cacheShard) cleanBacklog() int {
+	s.lock.RLock()
+	backlog := s.entries.Len() - len(s.hashmap)
+	s.lock.RUnlock()
+	return backlog
+}
+
+// expiredBacklog counts queued entries whose insertion time is older than the life
+// window at currentTime. Such entries are still occupying queue memory and may also
+// remain reachable through the key index until the head of the FIFO reaches them,
+// which is exactly the accumulation that drives memory growth under a slow cleaner.
+// Caller must hold at least a read lock.
+func (s *cacheShard) expiredBacklogLocked(currentTime uint64) int64 {
+	threshold := int64(currentTime) - int64(s.lifeWindow)
+	var expired int64
+	for i := range s.expiryBuckets {
+		if s.expiryBuckets[i].second <= threshold {
+			expired += s.expiryBuckets[i].count
+			continue
+		}
+		break
+	}
+	return expired
+}
+
+// expiredBacklog returns a lock-guarded snapshot of entries already past their life
+// window that have not yet been reclaimed by the cleaner.
+func (s *cacheShard) expiredBacklog(currentTime uint64) int64 {
+	s.lock.RLock()
+	expired := s.expiredBacklogLocked(currentTime)
+	s.lock.RUnlock()
+	return expired
+}
+
+// trackPush records one queued entry under its insertion second. Entries leave the
+// queue in insertion order, so equal-second entries are merged into the tail bucket.
+// Caller must hold the write lock.
+func (s *cacheShard) trackPush(second int64) {
+	if n := len(s.expiryBuckets); n > 0 && s.expiryBuckets[n-1].second == second {
+		s.expiryBuckets[n-1].count++
+		return
+	}
+	// Clamping protects against non-monotonic test clocks: never insert a bucket
+	// behind the current tail, which would break the FIFO bucket ordering.
+	if n := len(s.expiryBuckets); n > 0 && second < s.expiryBuckets[n-1].second {
+		second = s.expiryBuckets[n-1].second
+	}
+	s.expiryBuckets = append(s.expiryBuckets, expiryBucket{second: second, count: 1})
+}
+
+// trackPop removes one entry from the oldest non-empty bucket and drops the bucket
+// once drained, keeping the slice proportional to the entry age spread.
+// Caller must hold the write lock.
+func (s *cacheShard) trackPop() {
+	for i := range s.expiryBuckets {
+		if s.expiryBuckets[i].count > 0 {
+			s.expiryBuckets[i].count--
+			if s.expiryBuckets[i].count == 0 {
+				s.expiryBuckets = append(s.expiryBuckets[:i], s.expiryBuckets[i+1:]...)
+			}
+			return
+		}
+	}
+}
+
 func (s *cacheShard) getEntry(hashedKey uint64) ([]byte, error) {
 	s.lock.RLock()
 
@@ -329,6 +443,7 @@ func (s *cacheShard) copyHashedKeys() (keys []uint64, next int) {
 func (s *cacheShard) removeOldestEntry(reason RemoveReason) error {
 	oldest, err := s.entries.Pop()
 	if err == nil {
+		s.trackPop()
 		hash := readHashFromEntry(oldest)
 		if hash == 0 {
 			// entry has been explicitly deleted with resetHashFromEntry, ignore
@@ -354,6 +469,7 @@ func (s *cacheShard) reset(config Config) {
 	s.hashmapStats = make(map[uint64]uint32, hashmapStatsCapacity)
 	s.entryBuffer = make([]byte, config.MaxEntrySize+headersSizeInBytes)
 	s.entries.Reset()
+	s.expiryBuckets = nil
 	s.lock.Unlock()
 }
 

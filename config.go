@@ -10,7 +10,18 @@ type Config struct {
 	LifeWindow time.Duration
 	// Interval between removing expired entries (clean up).
 	// If set to <= 0 then no action is performed. Setting to < 1 second is counterproductive — bigcache has a one second resolution.
+	// With adaptive cleaning (default), CleanWindow only acts as a safety-net interval:
+	// the cleaner is additionally woken up by write traffic, so expired entries are reclaimed
+	// at roughly the same pace they are produced instead of piling up until the next tick.
 	CleanWindow time.Duration
+	// CleanBatchSize caps how many expired entries a single shard may drop during one
+	// cleaner pass. Bounding the work per pass keeps each shard lock held only briefly,
+	// so background cleaning does not stall concurrent writers. The remaining expired
+	// entries are reclaimed by subsequent write-driven passes, letting the cleaner keep
+	// up with the write rate without a CPU-intensive bulk sweep.
+	// Defaults to 4096 when set to 0. Set to -1 to restore the legacy behavior of
+	// evicting every expired entry in one pass per shard.
+	CleanBatchSize int
 	// Max number of entries in life window. Used only to calculate initial size for cache shards.
 	// When proper value is set then additional memory allocation does not occur.
 	MaxEntriesInWindow int
@@ -50,6 +61,35 @@ type Config struct {
 	// Logger is a logging interface and used in combination with `Verbose`
 	// Defaults to `DefaultLogger()`
 	Logger Logger
+}
+
+const (
+	// defaultCleanBatchSize is applied when Config.CleanBatchSize is left at its zero value.
+	defaultCleanBatchSize = 4096
+	// cleanUnlimited restores the legacy cleanUp semantics: evict everything expired in one pass.
+	cleanUnlimited = -1
+	// cleanWakeupWrites is the number of Set/Append calls after which writers nudge the cleaner.
+	// The signal is coalesced and throttled by minCleanInterval, so a larger threshold only
+	// reduces empty sweeps; the CleanWindow ticker still guarantees a maximum reaction lag.
+	cleanWakeupWrites = 8192
+	// minCleanInterval bounds how often the cleaner may run after a write-driven wake-up,
+	// preventing a hot write path from turning cleaning into a busy loop.
+	minCleanInterval = 5 * time.Millisecond
+	// maxCleanBatchSize hard-caps the adaptive per-shard, per-pass eviction budget so
+	// even an extreme write burst cannot hold a shard lock for an unbounded time.
+	maxCleanBatchSize = 65536
+)
+
+// effectiveCleanBatchSize resolves the configured per-pass eviction limit.
+func (c Config) effectiveCleanBatchSize() int {
+	switch {
+	case c.CleanBatchSize == cleanUnlimited:
+		return cleanUnlimited
+	case c.CleanBatchSize <= 0:
+		return defaultCleanBatchSize
+	default:
+		return c.CleanBatchSize
+	}
 }
 
 // DefaultConfig initializes config with default values.

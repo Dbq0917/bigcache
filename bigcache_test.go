@@ -3,9 +3,9 @@ package bigcache
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"math"
-	"crypto/rand"
 	mrand "math/rand/v2"
 	"runtime"
 	"strings"
@@ -871,7 +871,16 @@ func TestWriteAndReadParallelSameKeyWithStats(t *testing.T) {
 
 	wg.Wait()
 
-	assertEqual(t, Stats{Hits: int64(n * ntest)}, cache.Stats())
+	stats := cache.Stats()
+	assertEqual(t, int64(n*ntest), stats.Hits)
+	assertEqual(t, int64(0), stats.Misses)
+	assertEqual(t, int64(0), stats.DelHits)
+	assertEqual(t, int64(0), stats.DelMisses)
+	assertEqual(t, int64(0), stats.Collisions)
+	// Every overwrite leaves the previous queue entry unreachable until the head
+	// catches up with it, so the 1000 writes to a single key produce 999 stale
+	// queue entries observed through the cleaning backlog metric.
+	assertEqual(t, int64(ntest-1), stats.CleanBacklog)
 	assertEqual(t, ntest*n, int(cache.KeyMetadata(key).RequestCount))
 }
 
@@ -1470,16 +1479,16 @@ func FuzzBigCache(f *testing.F) {
 	f.Add([]byte{
 		0, 1, 255, 0, 0, 99, // config: 1 shard, 1MB, entrySize=256, life=1s, clean=0, entries=100
 		0, 3, 'k', '1', 5, 'v', 'a', 'l', '1', '!', // Set "k1" = "val1!"
-		0, 3, 'k', '2', 3, 'a', 'b', 'c',             // Set "k2" = "abc"
-		1, 3, 'k', '1',                                 // Get "k1"
-		2, 3, 'k', '1',                                 // Delete "k1"
-		0, 3, 'k', '3', 200, 'x',                       // Set "k3" (val truncated)
+		0, 3, 'k', '2', 3, 'a', 'b', 'c', // Set "k2" = "abc"
+		1, 3, 'k', '1', // Get "k1"
+		2, 3, 'k', '1', // Delete "k1"
+		0, 3, 'k', '3', 200, 'x', // Set "k3" (val truncated)
 	})
 	f.Add([]byte{
 		2, 0, 10, 4, 1, 5, // config: 4 shards, unlimited, entrySize=11, life=5s, clean=1s, entries=6
 		0, 2, 'a', 'b', 3, 'x', 'y', 'z', // Set "ab" = "xyz"
 		0, 2, 'a', 'b', 3, '1', '2', '3', // Set "ab" = "123" (overwrite)
-		1, 2, 'a', 'b',                     // Get "ab"
+		1, 2, 'a', 'b', // Get "ab"
 	})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
